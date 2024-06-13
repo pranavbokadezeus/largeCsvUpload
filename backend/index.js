@@ -7,7 +7,7 @@ const path = require('path')
 const csv = require('fast-csv')
 const fs = require('fs'); 
 const cors = require('cors')
-
+const retry = require('retry'); 
 
 
 const pool = require('./database');
@@ -67,7 +67,7 @@ let upload = multer({
 
 
 app.get('/', (req, res) => {
-  const sql = "SELECT id, name,email, contact FROM employee_data order by id asc limit 10";
+  const sql = "SELECT id, name,email, contact FROM employee_data order by id asc";
     pool.query(sql , (err , data) => {
         if(err) return res.json("Error");
         return res.json(data);
@@ -76,20 +76,27 @@ app.get('/', (req, res) => {
     // res.sendFile(__dirname + "/index.html")
 })
 
-app.post('/add' , (req , res) => {
-  const qry = "INSERT IGNORE INTO employee_data (`name`, `contact`, `email`) VALUES ?";
+// ------------------------------------------
+
+
+app.post('/add' ,async (req , res) => {
+  
+  const qry = "REPLACE INTO employee_data (`name`, `contact`, `email`) VALUES ?";
   const values = [
     [req.body.name,
     req.body.contact,
     req.body.email]
 ];
-  pool.query(qry , [values], (err , data) => {
+  await pool.query(qry , [values], (err , data) => {
     if(err) return console.log(err);
     else {
       return res.json("Data uploaded successfully")
     }
   })
 })
+
+
+
 
 app.put('/update/:id' , (req , res) => {
   const qry = "update employee_data set `name` = ?, `email` = ?, `contact` = ? where `id` = ?";
@@ -141,22 +148,134 @@ function uploadCsv(path) {
   .on('end' , function() {
     csvDataColl.shift()
 
-    pool.getConnection((error, connection) => {
+    const retryCount = 5;
+
+    attemptUpload(1);
+
+  function attemptUpload(attempt) {
+
+    pool.getConnection(async (error, connection) => {
       if(error) {
-        console.log(error)
+        
+        if (attempt <= retryCount) {
+          console.log(`Retry attempt ${attempt} due to connection error...`);
+          attemptUpload(attempt + 1);
+        } else {
+          console.log(error)
+        }
       }
       else {
-        let query = "INSERT IGNORE INTO employee_data (name, contact, email) VALUES ?"
-        connection.query(query, [csvDataColl], (error, res) => {
-          console.log(error || res)
+        
+        connection.beginTransaction((err) => {
+          if(err) {
+            if (attempt <= retryCount) {
+              console.log(`Retry attempt ${attempt} due to connection error...`);
+              attemptUpload(attempt + 1);
+            }else {
+            return res.status(400).json({
+              message: "Error Occured"
+            })
+          }
+          }
+          let query = "INSERT IGNORE INTO employee_data (name, contact, email) VALUES ?"
+            connection.query(query, [csvDataColl], (error, res) => {
+              // console.log(error || res)
+              if (error && error.code === 'ER_LOCK_DEADLOCK' && attempt <= retryCount) {
+                console.log(`Retry attempt ${attempt} due to deadlock...`);
+                connection.release();
+                attemptUpload(attempt + 1);
+                return;
+              }
+            });
+            
         })
-
+        connection.commit(function(err) {
+          if(err) {
+            return connection.rollback(function() {
+              throw err;
+            })
+          }
+          console.log("success");
+        });
+          connection.release();
       }
     })
+
+  }
     fs.unlinkSync(path)
   })
   stream.pipe(fileStream)
 }
+
+// --------------------------------------------------------------------------------------
+
+// function uploadCsv(path, retryCount = 5) {
+//   let stream = fs.createReadStream(path);
+//   let csvDataColl = [];
+
+//   let fileStream = csv
+//     .parse()
+//     .on('data', function(data) {
+//       csvDataColl.push(data);
+//     })
+//     .on('end' , function() {
+//       csvDataColl.shift(); // Assuming this removes the header row
+
+//       attemptUpload(1);
+
+//       function attemptUpload(attempt) {
+//         pool.getConnection(async (error, connection) => {
+//           if (error) {
+//             console.log(error);
+//             // Handle error, optionally retry or delete file
+//             if (attempt <= retryCount) {
+//               console.log(`Retry attempt ${attempt} due to connection error...`);
+//               attemptUpload(attempt + 1);
+//             } else {
+//               // Optionally delete the file on failure
+//               fs.unlinkSync(path);
+//             }
+//             return;
+//           }
+
+//           let query = "REPLACE INTO employee_data (name, contact, email) VALUES ?";
+//           connection.query(query, [csvDataColl], (error, res) => {
+//             if (error && error.code === 'ER_LOCK_DEADLOCK' && attempt <= retryCount) {
+//               console.log(`Retry attempt ${attempt} due to deadlock...`);
+//               connection.release();
+//               attemptUpload(attempt + 1);
+//               return;
+//             }
+
+//             if (error) {
+//               console.log(error);
+//               // Handle other database query errors, optionally delete file
+//             } else {
+//               console.log(res); // Logging successful database operation result
+//             }
+            
+//             // Release connection back to pool
+//             connection.release();
+
+//             // Delete the file after database operation completes
+//             fs.unlink(path, (err) => {
+//               if (err) {
+//                 console.log(err);
+//                 // Handle file deletion error
+//               } else {
+//                 console.log(`Deleted file: ${path}`);
+//               }
+//             });
+//           });
+//         });
+//       }
+//     });
+
+//   stream.pipe(fileStream);
+// }
+
+// ---------------------------------------------------------------------------------------
+
 
 app.listen(port, () => {
   console.log(`app running at http://localhost:${port}`)
